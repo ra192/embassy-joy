@@ -6,16 +6,69 @@ use defmt_rtt as _;
 use embassy_executor::Spawner;
 use embassy_stm32::gpio::{Level, Output, Speed};
 use embassy_stm32::rcc::{
-    ADCPrescaler, APBPrescaler, AHBPrescaler, Hse, HseMode, Pll, PllMul, PllPreDiv, PllSource,
+    ADCPrescaler, AHBPrescaler, APBPrescaler, Hse, HseMode, Pll, PllMul, PllPreDiv, PllSource,
     Sysclk,
 };
 use embassy_stm32::time::Hertz;
+use embassy_stm32::usb::{Driver, InterruptHandler};
+use embassy_stm32::{Config, bind_interrupts, peripherals};
 use embassy_time::Timer;
+use embassy_usb::class::hid::{
+    Config as HidConfig, HidBootProtocol, HidSubclass, HidWriter, State,
+};
+use embassy_usb::{Builder, UsbDevice};
 use panic_probe as _;
+use static_cell::StaticCell;
+use usbd_hid::descriptor::{AsInputReport, SerializedDescriptor, gen_hid_descriptor};
+
+static HID_STATE: StaticCell<State> = StaticCell::new();
+
+struct UsbBuffers {
+    config_descriptor: [u8; 256],
+    bos_descriptor: [u8; 16],
+    control_buf: [u8; 64],
+}
+
+static USB_BUFS: StaticCell<UsbBuffers> = StaticCell::new();
+
+bind_interrupts!(struct Irqs {
+    USB_LP_CAN1_RX0 => InterruptHandler<peripherals::USB>;
+});
+
+type UsbDriver = Driver<'static, peripherals::USB>;
+
+/// 8 buttons + absolute X/Y axes.
+#[gen_hid_descriptor(
+    (collection = APPLICATION, usage_page = GENERIC_DESKTOP, usage = JOYSTICK) = {
+        (usage_page = BUTTON, usage_min = BUTTON_1, usage_max = BUTTON_8) = {
+            #[packed_bits = 8] #[item_settings(data,variable,absolute)] buttons=input;
+        };
+        (collection = PHYSICAL, usage = POINTER) = {
+            (usage_page = GENERIC_DESKTOP, usage = X) = {
+                #[item_settings(data,variable,absolute)] x=input;
+            };
+            (usage_page = GENERIC_DESKTOP, usage = Y) = {
+                #[item_settings(data,variable,absolute)] y=input;
+            };
+        };
+    }
+)]
+struct JoystickReport {
+    buttons: u8,
+    /// centered at 128
+    x: u8,
+    /// centered at 128
+    y: u8,
+}
+
+#[embassy_executor::task]
+async fn usb_task(mut dev: UsbDevice<'static, UsbDriver>) -> ! {
+    dev.run().await
+}
 
 #[embassy_executor::main]
-async fn main(_spawner: Spawner) {
-    let mut config = embassy_stm32::Config::default();
+async fn main(spawner: Spawner) {
+    let mut config = Config::default();
 
     // HSE: external 8 MHz crystal
     config.rcc.hse = Some(Hse {
@@ -40,20 +93,87 @@ async fn main(_spawner: Spawner) {
     // ADC = 12 MHz (< 14 MHz max)
     config.rcc.adc_pre = ADCPrescaler::DIV6;
 
-    // USB: with PLL @ 72 MHz embassy sets USBPRE=DIV1_5 -> USBCLK = 48 MHz automatically.
-
     let p = embassy_stm32::init(config);
+
     info!("Hello World!");
 
     let mut led = Output::new(p.PC13, Level::High, Speed::Low);
 
-    loop {
-        info!("led on!");
-        led.set_high();
-        Timer::after_millis(500).await;
+    // PA12 = D+, PA11 = D-
+    let driver = Driver::new(p.USB, Irqs, p.PA12, p.PA11);
 
-        info!("led off!");
-        led.set_low();
-        Timer::after_millis(500).await;
+    let mut usb_config = embassy_usb::Config::new(0x16c0, 0x27dd);
+    usb_config.composite_with_iads = false;
+    usb_config.device_class = 0x00;
+    usb_config.device_sub_class = 0x00;
+    usb_config.device_protocol = 0x00;
+    usb_config.manufacturer = Some("Embassy");
+    usb_config.product = Some("HID Joystick");
+    usb_config.serial_number = Some("12345678");
+
+    let UsbBuffers {
+        config_descriptor,
+        bos_descriptor,
+        control_buf,
+    } = USB_BUFS.init(UsbBuffers {
+        config_descriptor: [0; 256],
+        bos_descriptor: [0; 16],
+        control_buf: [0; 64],
+    });
+    let config_descriptor: &mut [u8] = config_descriptor;
+    let bos_descriptor: &mut [u8] = bos_descriptor;
+    let control_buf: &mut [u8] = control_buf;
+
+    let mut builder = Builder::new(
+        driver,
+        usb_config,
+        config_descriptor,
+        bos_descriptor,
+        &mut [],
+        control_buf,
+    );
+
+    let hid_config = HidConfig {
+        report_descriptor: JoystickReport::desc(),
+        request_handler: None,
+        poll_ms: 10,
+        max_packet_size: 8,
+        hid_subclass: HidSubclass::No,
+        hid_boot_protocol: HidBootProtocol::None,
+    };
+
+    let state = HID_STATE.init(State::new());
+    let mut writer: HidWriter<'_, _, 8> = HidWriter::new(&mut builder, state, hid_config);
+
+    let usb = builder.build();
+    spawner.spawn(unwrap!(usb_task(usb)));
+
+    let mut btn = 0u8;
+    let mut phase = 0i16;
+
+    loop {
+        // triangle-wave sweep of X between -100 and 100, Y centered
+        let t = phase * 25 - 100;
+        let x = (t.clamp(-100, 100) + 128) as u8;
+        let y: u8 = 128;
+        phase += 1;
+        if phase > 8 {
+            phase = -8;
+            btn = if btn >= 7 { 0 } else { btn + 1 };
+        }
+
+        match writer
+            .write_serialize(&JoystickReport {
+                buttons: 1 << btn,
+                x,
+                y,
+            })
+            .await
+        {
+            Ok(()) => led.set_low(),
+            Err(_) => led.set_high(),
+        }
+
+        Timer::after_millis(10).await;
     }
 }

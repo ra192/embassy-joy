@@ -359,6 +359,7 @@ dependencies = [
  "nb 1.1.0",
  "panic-probe",
  "static_cell",
+ "usbd-hid",
 ]
 
 [[package]]
