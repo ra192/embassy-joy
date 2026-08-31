@@ -5,7 +5,7 @@ use defmt::*;
 use defmt_rtt as _;
 use embassy_executor::Spawner;
 use embassy_futures::join::join;
-use embassy_stm32::gpio::{Level, Output, Speed};
+use embassy_stm32::gpio::{Input, Level, Output, Pull, Speed};
 use embassy_stm32::rcc::{
     ADCPrescaler, AHBPrescaler, APBPrescaler, Hse, HseMode, Pll, PllMul, PllPreDiv, PllSource,
     Sysclk,
@@ -53,6 +53,22 @@ struct JoystickReport {
     y: u8,
 }
 
+/// Scan the 8x8 matrix (active-low). Returns a 64-bit mask; bit[i*8+c] set when
+/// the key at row i, column c is pressed.
+fn scan_matrix(rows: &mut [Output; 8], cols: &[Input; 8]) -> u64 {
+    let mut mask = 0u64;
+    for r in 0..8 {
+        rows[r].set_low();
+        for (c, col) in cols.iter().enumerate() {
+            if col.is_low() {
+                mask |= 1u64 << (r * 8 + c);
+            }
+        }
+        rows[r].set_high();
+    }
+    mask
+}
+
 #[embassy_executor::main]
 async fn main(_spawner: Spawner) {
     let mut config = Config::default();
@@ -85,6 +101,28 @@ async fn main(_spawner: Spawner) {
     info!("Joystick initialized");
 
     let mut led = Output::new(p.PC13, Level::High, Speed::Low);
+
+    let cols = [
+        Input::new(p.PB12, Pull::Up),
+        Input::new(p.PB13, Pull::Up),
+        Input::new(p.PB14, Pull::Up),
+        Input::new(p.PB15, Pull::Up),
+        Input::new(p.PA8, Pull::Up),
+        Input::new(p.PA9, Pull::Up),
+        Input::new(p.PA10, Pull::Up),
+        Input::new(p.PA15, Pull::Up),
+    ];
+
+    let mut rows = [
+        Output::new(p.PB3, Level::High, Speed::Low),
+        Output::new(p.PB4, Level::High, Speed::Low),
+        Output::new(p.PB5, Level::High, Speed::Low),
+        Output::new(p.PB6, Level::High, Speed::Low),
+        Output::new(p.PB7, Level::High, Speed::Low),
+        Output::new(p.PB8, Level::High, Speed::Low),
+        Output::new(p.PB9, Level::High, Speed::Low),
+        Output::new(p.PB11, Level::High, Speed::Low),
+    ];
 
     // PA12 = D+, PA11 = D-
     let driver = Driver::new(p.USB, Irqs, p.PA12, p.PA11);
@@ -133,24 +171,14 @@ async fn main(_spawner: Spawner) {
 
     // Do stuff with the class!
     let hid_fut = async {
-        let mut btn = 0u8;
-        let mut phase = 0i16;
         loop {
-            // triangle-wave sweep of X between -100 and 100, Y centered
-            let t = phase * 25 - 100;
-            let x = (t.clamp(-100, 100) + 128) as u8;
-            let y: u8 = 128;
-            phase += 1;
-            if phase > 8 {
-                phase = -8;
-                btn = if btn >= 63 { 0 } else { btn + 1 };
-            }
+            let keys = scan_matrix(&mut rows, &cols);
+            let buttons_low = keys as u32;
+            let buttons_high = (keys >> 32) as u32;
 
-            let (buttons_low, buttons_high) = if btn < 32 {
-                (1u32 << btn, 0u32)
-            } else {
-                (0u32, 1u32 << (btn - 32))
-            };
+            let x: u8 = 128;
+            let y: u8 = 128;
+
             match writer
                 .write_serialize(&JoystickReport {
                     buttons_low,

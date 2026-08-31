@@ -32,5 +32,5 @@ debug = 2
 
 [package.metadata.embassy]
 build = [
-  { target = "thumbv7m-none-eabi", artifact-dir = "out/examples/stm32f1" }
+  { target = "thumbv7m-none-eabi", artifact-dir = "out/stm32f1" }
 ]
