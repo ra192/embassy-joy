@@ -21,6 +21,9 @@ use embassy_usb::class::hid::{
 use panic_probe as _;
 use usbd_hid::descriptor::{AsInputReport, SerializedDescriptor, gen_hid_descriptor};
 
+const ROWS: usize = 8;
+const COLS: usize = 8;
+
 bind_interrupts!(struct Irqs {
     USB_LP_CAN1_RX0 => InterruptHandler<peripherals::USB>;
 });
@@ -55,16 +58,16 @@ struct JoystickReport {
 
 /// Scan the 8x8 matrix (active-low). Returns a 64-bit mask; bit[i*8+c] set when
 /// the key at row i, column c is pressed.
-fn scan_matrix(rows: &mut [Output; 8], cols: &[Input; 8]) -> u64 {
+fn scan_matrix(rows: &mut [Output; ROWS], cols: &[Input; COLS]) -> u64 {
     let mut mask = 0u64;
-    for r in 0..8 {
-        rows[r].set_low();
+    for (r, row) in rows.iter_mut().enumerate() {
+        row.set_low();
         for (c, col) in cols.iter().enumerate() {
             if col.is_low() {
                 mask |= 1u64 << (r * 8 + c);
             }
         }
-        rows[r].set_high();
+        row.set_high();
     }
     mask
 }
