@@ -25,11 +25,14 @@ bind_interrupts!(struct Irqs {
     USB_LP_CAN1_RX0 => InterruptHandler<peripherals::USB>;
 });
 
-/// 8 buttons + absolute X/Y axes.
+/// 64 buttons + absolute X/Y axes.
 #[gen_hid_descriptor(
     (collection = APPLICATION, usage_page = GENERIC_DESKTOP, usage = JOYSTICK) = {
-        (usage_page = BUTTON, usage_min = BUTTON_1, usage_max = BUTTON_8) = {
-            #[packed_bits = 8] #[item_settings(data,variable,absolute)] buttons=input;
+        (usage_page = BUTTON, usage_min = BUTTON_1, usage_max = 32) = {
+            #[packed_bits = 32] #[item_settings(data,variable,absolute)] buttons_low=input;
+        };
+        (usage_page = BUTTON, usage_min = 33, usage_max = 64) = {
+            #[packed_bits = 32] #[item_settings(data,variable,absolute)] buttons_high=input;
         };
         (collection = PHYSICAL, usage = POINTER) = {
             (usage_page = GENERIC_DESKTOP, usage = X) = {
@@ -42,7 +45,8 @@ bind_interrupts!(struct Irqs {
     }
 )]
 struct JoystickReport {
-    buttons: u8,
+    buttons_low: u32,
+    buttons_high: u32,
     /// centered at 128
     x: u8,
     /// centered at 128
@@ -78,7 +82,7 @@ async fn main(_spawner: Spawner) {
 
     let p = embassy_stm32::init(config);
 
-    info!("Hello World!");
+    info!("Joystick initialized");
 
     let mut led = Output::new(p.PC13, Level::High, Speed::Low);
 
@@ -90,8 +94,8 @@ async fn main(_spawner: Spawner) {
     usb_config.device_class = 0x00;
     usb_config.device_sub_class = 0x00;
     usb_config.device_protocol = 0x00;
-    usb_config.manufacturer = Some("Embassy");
-    usb_config.product = Some("HID Joystick");
+    usb_config.manufacturer = Some("STMicroelectronics");
+    usb_config.product = Some("STM32 HID Joystick");
     usb_config.serial_number = Some("12345678");
 
     // Create embassy-usb DeviceBuilder using the driver and config.
@@ -115,12 +119,12 @@ async fn main(_spawner: Spawner) {
         report_descriptor: JoystickReport::desc(),
         request_handler: None,
         poll_ms: 10,
-        max_packet_size: 8,
+        max_packet_size: 16,
         hid_subclass: HidSubclass::No,
         hid_boot_protocol: HidBootProtocol::None,
     };
 
-    let mut writer: HidWriter<'_, _, 8> = HidWriter::new(&mut builder, &mut state, hid_config);
+    let mut writer: HidWriter<'_, _, 16> = HidWriter::new(&mut builder, &mut state, hid_config);
 
     let mut usb = builder.build();
 
@@ -139,12 +143,18 @@ async fn main(_spawner: Spawner) {
             phase += 1;
             if phase > 8 {
                 phase = -8;
-                btn = if btn >= 7 { 0 } else { btn + 1 };
+                btn = if btn >= 63 { 0 } else { btn + 1 };
             }
 
+            let (buttons_low, buttons_high) = if btn < 32 {
+                (1u32 << btn, 0u32)
+            } else {
+                (0u32, 1u32 << (btn - 32))
+            };
             match writer
                 .write_serialize(&JoystickReport {
-                    buttons: 1 << btn,
+                    buttons_low,
+                    buttons_high,
                     x,
                     y,
                 })
