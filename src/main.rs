@@ -23,6 +23,9 @@ use usbd_hid::descriptor::{AsInputReport, SerializedDescriptor, gen_hid_descript
 
 const ROWS: usize = 8;
 const COLS: usize = 8;
+/// Number of consecutive scans a key must hold the same state before it is
+/// reported (agree-count debounce).
+const AGREE_COUNT: u8 = 3;
 
 bind_interrupts!(struct Irqs {
     USB_LP_CAN1_RX0 => InterruptHandler<peripherals::USB>;
@@ -56,9 +59,34 @@ struct JoystickReport {
     y: u8,
 }
 
-/// Scan the 8x8 matrix (active-low). Returns a 64-bit mask; bit[i*8+c] set when
-/// the key at row i, column c is pressed.
-fn scan_matrix(rows: &mut [Output; ROWS], cols: &[Input; COLS]) -> u64 {
+/// Scan the 8x8 matrix (active-low) with agree-count debouncing. Returns a
+/// 64-bit mask; bit[i*8+c] set when the key at row i, column c is pressed.
+///
+/// `history` tracks, per key, how many consecutive scans a key has agreed on
+/// its current (pressed/released) state, capped at `AGREE_COUNT`. The reported
+/// mask only reflects state that has been stable for `AGREE_COUNT` scans.
+fn scan_matrix(
+    rows: &mut [Output; ROWS],
+    cols: &[Input; COLS],
+    history: &mut [u8; ROWS * COLS],
+) -> u64 {
+    let raw = raw_scan(rows, cols);
+    let mut mask = 0u64;
+    for i in 0..(ROWS * COLS) {
+        let pressed = (raw >> i) & 1 == 1;
+        if pressed && history[i] < AGREE_COUNT {
+            history[i] += 1;
+        } else if !pressed && history[i] > 0 {
+            history[i] -= 1;
+        }
+        if history[i] == AGREE_COUNT {
+            mask |= 1 << i;
+        }
+    }
+    mask
+}
+
+fn raw_scan(rows: &mut [Output; ROWS], cols: &[Input; COLS]) -> u64 {
     let mut mask = 0u64;
     for (r, row) in rows.iter_mut().enumerate() {
         row.set_low();
@@ -127,6 +155,8 @@ async fn main(_spawner: Spawner) {
         Output::new(p.PB11, Level::High, Speed::Low),
     ];
 
+    let mut history = [0u8; ROWS * COLS];
+
     // PA12 = D+, PA11 = D-
     let driver = Driver::new(p.USB, Irqs, p.PA12, p.PA11);
 
@@ -175,7 +205,7 @@ async fn main(_spawner: Spawner) {
     // Do stuff with the class!
     let hid_fut = async {
         loop {
-            let keys = scan_matrix(&mut rows, &cols);
+            let keys = scan_matrix(&mut rows, &cols, &mut history);
             let buttons_low = keys as u32;
             let buttons_high = (keys >> 32) as u32;
 
